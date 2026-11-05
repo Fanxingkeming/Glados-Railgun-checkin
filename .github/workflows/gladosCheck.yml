@@ -61,6 +61,7 @@ jobs:
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
+        GLADOS_STRICT: ${{ secrets.GLADOS_STRICT }}
 
     # 签到失败（配置错误会 exit 1）时也要保活，否则恰好错过最需要提醒的那次
     - name: Keep alive

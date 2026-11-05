@@ -16,6 +16,10 @@ Thumbs.db
 .env.local
 .env.*.local
 
+# Virtualenv
+.venv/
+venv/
+
 # Logs
 logs
 *.log

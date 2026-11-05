@@ -37,6 +37,7 @@
 | `SERVERCHAN_SENDKEY` | 否 | Server酱 推送，见[消息推送](#消息推送) |
 | `GLADOS_EXCHANGE_PLAN` | 否 | `plan100` / `plan200` / `plan500`，见[积分兑换](#积分兑换) |
 | `GLADOS_VERBOSE` | 否 | `true` / `1` / `yes` 输出详细日志 |
+| `GLADOS_STRICT` | 否 | 默认 `true`：签到失败时工作流变红；设 `false` 则只推送不报错 |
 
 ## 🔧配置 GLADOS_COOKIES
 
@@ -66,7 +67,7 @@
 | --- | :---: | --- |
 | `cookie` | **是** | 完整 Cookie，含 `koa:sess` 或 `gld:sess`，不能为空 |
 | `name` | 否 | 备注名，不填显示 `账号1` |
-| `origin` | 否 | Cookie 所属域名，不填自动探测 |
+| `origin` | 否 | Cookie 所属域名，**建议填写**；不填则自动探测 |
 | `user-agent` | 否 | 提取 Cookie 时的浏览器 UA，建议填写 |
 
 **要点**
@@ -74,6 +75,7 @@
 - 字段名固定，出现其他字段直接报错。
 - 重复 Cookie 自动去重，不会重复签到。
 - 旧 `&` 分隔仍兼容但会提示迁移；换行分隔、字符串数组、单个对象已不支持。
+- **填了 `origin` 就完全跳过域名探测**，直接对这一个域名发请求，最省时间也最不容易被限流。
 
 **如何获取**
 
@@ -83,7 +85,7 @@
 
 `glados.cloud` → `railgun.info` → `glados.network` → `glados.rocks` → `glados.one` → `glados.space` → `glados.vip` → `glados-facility.com`
 
-探测用短超时快速筛一遍；只对**网络无响应**的域名再试一次，返回「没有权限」的不重试。
+探测用短超时**并发**发起（4 线程、错峰 0.15s、命中即停），只对**网络无响应**的域名再试一次，返回「没有权限」的不重试。
 
 ## 🎁积分兑换
 
@@ -142,6 +144,10 @@ schedule:
 ```
 
 ## 🔍问题排查
+
+> [!TIP]
+> 每次运行的结论都会写进运行页面的 **Summary** 标签（一张结果表），不用点进日志翻。
+> 有账号签到失败时该次运行会**标红**；不想看到红色就设 `GLADOS_STRICT=false`。
 
 **正常日志**
 

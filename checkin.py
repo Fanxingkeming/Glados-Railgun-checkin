@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -94,6 +95,12 @@ POINTS_TIMEOUT = (10, 30)
 
 """单次运行总预算（秒）。到期后跳过剩余账号，避免 Actions 长时间挂起"""
 RUN_BUDGET_SECONDS = 300
+
+"""并发探测候选域名的线程数；串行探测 8 个域名最坏要 2 分钟，并发后压到十几秒"""
+PROBE_WORKERS = 4
+
+"""并发探测的错峰间隔（秒/域名）：避免同一时刻向 8 个域名齐发请求"""
+PROBE_STAGGER_SECONDS = 0.15
 
 """Cookie 中标识登录态的会话字段"""
 SESSION_FIELDS = ("koa:sess=", "gld:sess=")
@@ -418,42 +425,109 @@ class CookieEntry:
         return ordered
 
     def _probe(self, domain: str, probing: bool, config: "Config") -> Tuple[ProbeResult, Optional[int], Optional[int]]:
-        """探测单域名，返回 (结果类型, 剩余天数, code)。异常按网络问题处理，不中断整轮。"""
+        """探测单域名，返回 (结果类型, 剩余天数, code)。异常按网络问题处理，不中断整轮。
+
+        quiet=True：探测是并发的，逐条打日志会交错成乱序，详细结论交给调用方按顺序输出。
+        """
         try:
-            with API(domain, self.cookie, label=self.label, verbose=config.verbose, probing=probing, user_agent=self.user_agent) as api:
+            with API(
+                domain,
+                self.cookie,
+                label=self.label,
+                verbose=config.verbose,
+                probing=probing,
+                user_agent=self.user_agent,
+                quiet=True,
+            ) as api:
                 data = api.fetch_status()
         except Exception as e:  # noqa: BLE001 - 单域名失败不应影响其他域名
-            logger.warning(f"{LogEmoji.WARNING} 探测 {domain} 时发生异常，按网络错误处理: {e}")
+            self.log(domain, LogEmoji.WARNING, f"探测异常，按网络问题处理: {e}")
             return ProbeResult.NETWORK, None, None
 
         if data is None:
+            self.log(domain, LogEmoji.WARNING, "探测无响应")
             return ProbeResult.NETWORK, None, None
         if not isinstance(data, dict):
-            logger.warning(f"{LogEmoji.WARNING} 探测 {domain} 返回非对象响应（{type(data).__name__}），按被拒处理")
+            self.log(domain, LogEmoji.WARNING, f"探测返回非对象响应（{type(data).__name__}），按被拒处理")
             return ProbeResult.REJECTED, None, -2
 
         code = data.get("code", -2)
         if code == 0 and isinstance(data.get("data"), dict):
             return ProbeResult.HIT, left_days(data), code
+        self.log(domain, LogEmoji.INFO, f"探测被拒(code={code})")
         return ProbeResult.REJECTED, None, code
+
+    def _probe_staggered(
+        self, domain: str, position: int, config: "Config"
+    ) -> Tuple[ProbeResult, Optional[int], Optional[int]]:
+        """错峰后探测：位置越靠后延迟越大，避免 8 个域名同一瞬间齐发"""
+        if position:
+            time.sleep(min(position * PROBE_STAGGER_SECONDS, 1.0))
+        return self._probe(domain, True, config)
+
+    def _probe_candidates(
+        self, candidates: List[str], config: "Config"
+    ) -> Tuple[Optional[str], Optional[int], Dict[str, Tuple[ProbeResult, Optional[int], Optional[int]]]]:
+        """并发探测全部候选域名，返回 (命中域名, 剩余天数, 已完成的结果表)。
+
+        任一域名命中即返回，未完成的探测被取消，不拖住主流程。
+        """
+        probes: Dict[str, Tuple[ProbeResult, Optional[int], Optional[int]]] = {}
+        if not candidates:
+            return None, None, probes
+
+        if len(candidates) > 1:
+            self.log(
+                self.origin or UNPROBED,
+                LogEmoji.INFO,
+                f"并发探测 {len(candidates)} 个候选域名（{PROBE_WORKERS} 线程，命中即停）",
+            )
+
+        executor = ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(candidates)), thread_name_prefix="probe")
+        futures = {
+            executor.submit(self._probe_staggered, domain, position, config): domain
+            for position, domain in enumerate(candidates)
+        }
+        hit: Optional[Tuple[str, Optional[int]]] = None
+        try:
+            for future in as_completed(futures):
+                domain = futures[future]
+                try:
+                    probes[domain] = future.result()
+                except Exception as e:  # noqa: BLE001 - 线程内任何异常都按网络问题处理
+                    self.log(domain, LogEmoji.WARNING, f"探测线程异常，按网络问题处理: {e}")
+                    probes[domain] = (ProbeResult.NETWORK, None, None)
+                if probes[domain][0] is ProbeResult.HIT:
+                    hit = (domain, probes[domain][1])
+                    break
+        finally:
+            # 命中后不再等待剩余线程；各探测会话会在自己的 with 块里关闭
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        return (hit[0], hit[1], probes) if hit else (None, None, probes)
 
     def _resolve_domain(self, config: "Config", budget: Optional[RunBudget] = None) -> Tuple[Optional[str], Optional[int]]:
         """探测账号实际所属域名，返回 (域名, 剩余天数)；全部失败返回 (None, None)。
 
+        并发探测（错峰 0.15s、命中即停）：串行版本在弱网下单个账号就要吃掉两分钟预算。
         命中时的 /api/user/status 结果直接复用为签到前的状态查询，不额外增加请求。
         首轮短超时快筛，仅对「无响应」的域名用短超时重试一次；总预算到期即停止。
         """
+        candidates = self._candidates(config)
         network: List[str] = []
         rejected: List[str] = []
 
-        for domain in self._candidates(config):
-            if budget is not None and budget.expired():
-                self.log(self.origin or UNPROBED, LogEmoji.WARNING, "运行超出预算，停止探测剩余域名", force=True)
-                break
-            kind, days, code = self._probe(domain, True, config)
-            if kind is ProbeResult.HIT:
-                self.log(domain, LogEmoji.SUCCESS, f"命中登录域名（剩余 {format_days(days)}）", force=True)
-                return domain, days
+        if budget is not None and budget.expired():
+            self.log(self.origin or UNPROBED, LogEmoji.WARNING, "运行超出预算，停止探测", force=True)
+            return None, None
+
+        hit_domain, hit_days, probes = self._probe_candidates(candidates, config)
+        if hit_domain is not None:
+            self.log(hit_domain, LogEmoji.SUCCESS, f"命中登录域名（剩余 {format_days(hit_days)}）", force=True)
+            return hit_domain, hit_days
+
+        for domain in candidates:
+            kind, _, code = probes.get(domain, (ProbeResult.NETWORK, None, None))
             if kind is ProbeResult.NETWORK:
                 network.append(domain)
             else:
@@ -711,12 +785,14 @@ class API:
         verbose: bool = False,
         probing: bool = False,
         user_agent: str = "",
+        quiet: bool = False,
     ):
         self.domain = domain
         self.cookie = cookie
         self.label = label or "-"
         self.verbose = verbose
         self.probing = probing
+        self.quiet = quiet
         self.user_agent = (user_agent or "").strip()
 
         if probing:
@@ -856,6 +932,9 @@ class API:
         return f"兑换失败: {message}"
 
     def log(self, emoji: str, message: str, force: bool = False) -> None:
+        # quiet 用于并发探测：日志会交错，改为探测完成后由主线程按顺序输出结论
+        if self.quiet:
+            return
         log_line(self.label, self.domain, emoji, message, self.verbose or force)
 
     # ---------------- 内部实现 ----------------
@@ -934,9 +1013,12 @@ class Config:
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
+    ENV_STRICT = "GLADOS_STRICT"
 
     DEFAULT_EXCHANGE_PLAN = "none"
     DEFAULT_VERBOSE = False
+    """签到失败是否让工作流变红（默认 True）；设为 false 则只推送不报错"""
+    DEFAULT_STRICT = True
 
     def __init__(self, env: Optional[Dict[str, str]] = None):
         self.env = env if env is not None else os.environ
@@ -945,6 +1027,7 @@ class Config:
         self.accounts = Accounts()
         self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
         self.verbose = self.DEFAULT_VERBOSE
+        self.strict = self.DEFAULT_STRICT
         self.load_error = ""
         self._load()
 
@@ -962,6 +1045,7 @@ class Config:
         self._load_push_keys()
         # verbose 必须先加载：Accounts.parse 需要它来决定新建账号的 verbose 初值
         self._load_verbose()
+        self._load_strict()
         self._load_accounts()
         self._load_exchange_plan()
 
@@ -1018,6 +1102,18 @@ class Config:
         else:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_VERBOSE}' 的值 '{value}' 无效，将使用默认值 {self.DEFAULT_VERBOSE}。")
 
+    def _load_strict(self) -> None:
+        """GLADOS_STRICT：签到失败是否让工作流变红。默认开启，避免账号静默掉线。"""
+        value = self._get(self.ENV_STRICT).lower()
+        if not value:
+            return
+        if value in TRUTHY:
+            self.strict = True
+        elif value in FALSY:
+            self.strict = False
+        else:
+            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_STRICT}' 的值 '{value}' 无效，将使用默认值 {self.DEFAULT_STRICT}。")
+
 
 # --------------------------------------------------------------------------- #
 # 报告与推送
@@ -1036,10 +1132,21 @@ class Report:
         return cls(Accounts(), error=error)
 
     @property
-    def title(self) -> str:
+    def counts(self) -> Tuple[int, int, int]:
+        """(成功, 失败, 重复)"""
         success = sum(1 for e in self.entries if e.result.code is CheckinStatus.SUCCESS)
-        repeat = sum(1 for e in self.entries if e.result.code is CheckinStatus.REPEAT)
         failed = sum(1 for e in self.entries if e.result.code is CheckinStatus.FAILURE)
+        repeat = sum(1 for e in self.entries if e.result.code is CheckinStatus.REPEAT)
+        return success, failed, repeat
+
+    @property
+    def has_failure(self) -> bool:
+        """是否存在签到失败的账号（用于决定退出码）"""
+        return self.counts[1] > 0
+
+    @property
+    def title(self) -> str:
+        success, failed, repeat = self.counts
 
         if self.error:
             # 部分失败时仍保留进度统计，只有完全没跑起来才只报错误
@@ -1047,6 +1154,38 @@ class Report:
                 return "# 脚本执行出错"
             return f"# 脚本执行出错 · 成功 {success} · 失败 {failed} · 重复 {repeat}"
         return f"GLaDOS 签到 · 成功 {success} · 失败 {failed} · 重复 {repeat}"
+
+    def summary_markdown(self) -> str:
+        """GitHub Actions Job Summary 用的 Markdown 表格，让结果直接出现在 run 首页"""
+        success, failed, repeat = self.counts
+        lines = [f"## GLaDOS 签到 · 成功 {success} · 失败 {failed} · 重复 {repeat}", ""]
+
+        if self.entries:
+            show_name = any(entry.name for entry in self.entries)
+            header = ["#"] + (["账号"] if show_name else []) + ["状态", "域名", "本次积分", "剩余天数", "总积分", "备注"]
+            rows = [header, ["---"] * len(header)]
+            for entry in self.entries:
+                r = entry.result
+                emoji, status = STATUS_META.get(r.code, (LogEmoji.ERROR, "签到失败"))
+                row = [str(entry.index)]
+                if show_name:
+                    row.append(entry.name or "未命名")
+                row += [
+                    f"{emoji} {status}",
+                    r.domain,
+                    str(r.points),
+                    format_days(r.days),
+                    format_points(r.points_total),
+                    r.note or "-",
+                ]
+                rows.append(row)
+            lines += ["| " + " | ".join(cells) + " |" for cells in rows]
+            lines.append("")
+
+        if self.error:
+            lines.append(f"> {self.error}")
+
+        return "\n".join(lines) + "\n"
 
     def render(self, line_sep: str = "\n") -> str:
         """渲染正文。line_sep：PushDeer 用 \\n；Server酱 用 '  \\n'（Markdown 硬换行）"""
@@ -1206,6 +1345,18 @@ class CheckinRunner:
 # --------------------------------------------------------------------------- #
 
 
+def write_step_summary(report: Report) -> None:
+    """把结果写进 GitHub Actions 的 Job Summary，run 首页直接可见（本地运行自动跳过）"""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fp:
+            fp.write(report.summary_markdown())
+    except OSError as e:
+        logger.warning(f"{LogEmoji.WARNING} 写入 Job Summary 失败: {e}")
+
+
 def main() -> None:
     """主流程：加载配置 → 签到 → 渲染报告 → 推送"""
     init_logger()
@@ -1241,6 +1392,16 @@ def main() -> None:
         PushService(config).send(report)
     except Exception as e:  # noqa: BLE001 - 推送异常不应改变退出码
         logger.error(f"{LogEmoji.ERROR} 推送阶段发生异常: {e}")
+
+    write_step_summary(report)
+
+    # 签到失败也要让工作流变红：否则账号静默掉线时，Actions 一直绿，只能靠翻推送发现
+    if exit_code == 0 and config is not None and config.strict and report.has_failure:
+        logger.error(
+            f"{LogEmoji.ERROR} 存在签到失败的账号，退出码置 2；"
+            f"若不希望工作流变红，设置环境变量 {Config.ENV_STRICT}=false"
+        )
+        exit_code = 2
 
     logger.info(f"{LogEmoji.END} 签到完成")
     if exit_code:
