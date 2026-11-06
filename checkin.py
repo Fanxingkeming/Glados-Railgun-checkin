@@ -371,18 +371,29 @@ class CookieEntry:
 
         # 签到没成功就去兑换，只会白花积分或再吃一次拒绝，故仅成功/重复时兑换
         if result.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT):
-            result.exchange = self._apply_exchange(api, config, domain)
+            result.exchange = self._apply_exchange(api, config, domain, result.points_total)
         else:
             self.log(domain, LogEmoji.INFO, "签到未成功，跳过自动兑换")
 
         result.note = self._expiry_note(result.days)
         return result
 
-    def _apply_exchange(self, api: "API", config: "Config", domain: str) -> str:
-        """按配置执行兑换；未配置时返回空串（配置状态不进推送正文）"""
+    def _apply_exchange(self, api: "API", config: "Config", domain: str, points_total: Optional[int]) -> str:
+        """按配置执行兑换；未配置或积分不足时返回空串（不多发请求、不刷「兑换失败」）"""
         required = config.exchange_plans.get(config.exchange_plan)
         if required is None:
             self.log(domain, LogEmoji.INFO, "未配置兑换计划，跳过自动兑换")
+            return ""
+
+        # 已查到积分且明显不够时直接跳过：兑换接口每次都会回「Not enough points」，
+        # 加密定时后一天会跑多次，没必要每轮都发一个注定失败的请求、还往报告里塞失败文案。
+        # 积分查询失败（None）时仍照常尝试，避免因为一次查询抖动错过兑换机会。
+        if points_total is not None and points_total < required:
+            self.log(
+                domain,
+                LogEmoji.INFO,
+                f"积分不足（现有 {format_points(points_total)}，需要 {required} 积分），攒够后再自动兑换",
+            )
             return ""
 
         self.log(domain, LogEmoji.EXCHANGE, f"开始兑换 {config.exchange_plan} (需要 {required} 积分)")
