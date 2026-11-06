@@ -28,7 +28,7 @@
 1. Fork 本仓库。
 2. 在自己的仓库进入 `Settings` → `Secrets and variables` → `Actions` → `New repository secret`，至少添加 `GLADOS_COOKIES`。
 3. 打开 `Actions` → `auto check` → `Run workflow` 手动跑一次，看到「签到成功」或「重复签到」即完成。
-4. 之后每天 **09:18 / 12:18**（北京时间）自动运行。
+4. 之后每天 **08:18 / 10:18 / 12:18 / 14:18 / 16:18**（北京时间）触发定时运行。GitHub 的定时任务常延迟数小时并跳过部分时间点，所以设了多个窗口；脚本幂等，只有真正签到成功或失败才会推送。
 
 | Secret | 必填 | 说明 |
 | --- | :---: | --- |
@@ -38,6 +38,7 @@
 | `GLADOS_EXCHANGE_PLAN` | 否 | `plan100` / `plan200` / `plan500`，见[积分兑换](#积分兑换) |
 | `GLADOS_VERBOSE` | 否 | `true` / `1` / `yes` 输出详细日志 |
 | `GLADOS_STRICT` | 否 | 默认 `true`：签到失败时工作流变红；设 `false` 则只推送不报错 |
+| `GLADOS_NOTIFY_REPEAT` | 否 | 默认 `false`：全部账号都是重复签到时跳过推送；设 `true` 则每次运行都推送 |
 
 ## 🔧配置 GLADOS_COOKIES
 
@@ -107,6 +108,8 @@
 | Server酱 | `SERVERCHAN_SENDKEY` | [sct.ftqq.com](https://sct.ftqq.com/) 微信扫码登录，在页面获取 SendKey |
 
 两个可单独或同时配置（都发，任一成功即视为成功）；都不配则跳过推送，不影响签到。
+
+**推送时机**：只有出现「签到成功」「签到失败」或脚本异常时才推送。若本轮全部账号都是「重复签到」（多时间点定时很常见），默认**静默跳过**，避免手机被刷屏；结果仍会写进 Actions 的 Job Summary。想每次都收到就设 `GLADOS_NOTIFY_REPEAT=true`。
 
 ### 推送效果
 
@@ -260,7 +263,7 @@ GLaDOS 会校验 UA 与登录设备。填了 `user-agent` 就原样使用；没�
 <details>
 <summary><strong>Q：签到失败会让 Actions 变红吗？</strong></summary>
 
-分两种情况：**配置错误**（未填 Cookie、JSON 格式非法）会以非 0 退出码结束，工作流变红；**业务失败**（Cookie 失效 `code=-2`、服务端 5xx）不会变红，避免偶发失败天天误报。因此业务失败需要自己关注推送或日志。
+默认**会变红**。`GLADOS_STRICT`（默认 `true`）让任何账号签到失败都以退出码 2 结束，配置错误（未填 Cookie、JSON 非法）则是退出码 1。这样 Cookie 失效不会静默掉线、Actions 还一直是绿的。若不希望变红，设 `GLADOS_STRICT=false`，此时只能靠推送或日志发现问题。
 
 </details>
 

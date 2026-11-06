@@ -8,7 +8,9 @@ on:
       - 'README.md'
       - 'imgs/**'
   schedule:
-    - cron: '18 9,12 * * *'
+    # GitHub 定时常延迟数小时、并跳过部分时间点；分散到多个时段保证每天至少命中一次。
+    # 脚本幂等，重复签到不推送，多跑几次没有副作用。
+    - cron: '18 8,10,12,14,16 * * *'
       timezone: 'Asia/Shanghai'
 
 # 定时与手动触发可能重叠：同一时间只保留一个运行，避免重复签到与重复推送
@@ -62,6 +64,7 @@ jobs:
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
         GLADOS_STRICT: ${{ secrets.GLADOS_STRICT }}
+        GLADOS_NOTIFY_REPEAT: ${{ secrets.GLADOS_NOTIFY_REPEAT }}
 
     # 签到失败（配置错误会 exit 1）时也要保活，否则恰好错过最需要提醒的那次
     - name: Keep alive

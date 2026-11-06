@@ -1014,11 +1014,14 @@ class Config:
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
     ENV_STRICT = "GLADOS_STRICT"
+    ENV_NOTIFY_REPEAT = "GLADOS_NOTIFY_REPEAT"
 
     DEFAULT_EXCHANGE_PLAN = "none"
     DEFAULT_VERBOSE = False
     """签到失败是否让工作流变红（默认 True）；设为 false 则只推送不报错"""
     DEFAULT_STRICT = True
+    """全部账号都是重复签到时是否仍推送（默认 False）；多个定时时间点下避免刷屏"""
+    DEFAULT_NOTIFY_REPEAT = False
 
     def __init__(self, env: Optional[Dict[str, str]] = None):
         self.env = env if env is not None else os.environ
@@ -1028,6 +1031,7 @@ class Config:
         self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
         self.verbose = self.DEFAULT_VERBOSE
         self.strict = self.DEFAULT_STRICT
+        self.notify_repeat = self.DEFAULT_NOTIFY_REPEAT
         self.load_error = ""
         self._load()
 
@@ -1046,6 +1050,7 @@ class Config:
         # verbose 必须先加载：Accounts.parse 需要它来决定新建账号的 verbose 初值
         self._load_verbose()
         self._load_strict()
+        self._load_notify_repeat()
         self._load_accounts()
         self._load_exchange_plan()
 
@@ -1114,6 +1119,18 @@ class Config:
         else:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_STRICT}' 的值 '{value}' 无效，将使用默认值 {self.DEFAULT_STRICT}。")
 
+    def _load_notify_repeat(self) -> None:
+        """GLADOS_NOTIFY_REPEAT：全部重复签到时是否仍推送。默认关闭，避免多时间点刷屏。"""
+        value = self._get(self.ENV_NOTIFY_REPEAT).lower()
+        if not value:
+            return
+        if value in TRUTHY:
+            self.notify_repeat = True
+        elif value in FALSY:
+            self.notify_repeat = False
+        else:
+            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_NOTIFY_REPEAT}' 的值 '{value}' 无效，将使用默认值 {self.DEFAULT_NOTIFY_REPEAT}。")
+
 
 # --------------------------------------------------------------------------- #
 # 报告与推送
@@ -1143,6 +1160,18 @@ class Report:
     def has_failure(self) -> bool:
         """是否存在签到失败的账号（用于决定退出码）"""
         return self.counts[1] > 0
+
+    @property
+    def is_repeat_only(self) -> bool:
+        """本轮没有新签到、没有失败、没有异常，全部账号都是重复签到。
+
+        用于多个定时时间点下静默多余推送：重复签到不改变任何状态，推了也是噪音。
+        出错、无结果、有成功或有失败时一律返回 False，保证告警不丢。
+        """
+        if self.error or not self.entries:
+            return False
+        success, failed, repeat = self.counts
+        return success == 0 and failed == 0 and repeat == len(self.entries)
 
     @property
     def title(self) -> str:
@@ -1389,7 +1418,14 @@ def main() -> None:
     # 推送放在 try 之外：即使配置解析失败，也要尽力把错误通知出去
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
     try:
-        PushService(config).send(report)
+        notify_repeat = config.notify_repeat if config is not None else False
+        if report.is_repeat_only and not notify_repeat:
+            logger.info(
+                f"{LogEmoji.INFO} 本轮全部为重复签到，跳过推送"
+                f"（如需每次都推送，设置 {Config.ENV_NOTIFY_REPEAT}=true）"
+            )
+        else:
+            PushService(config).send(report)
     except Exception as e:  # noqa: BLE001 - 推送异常不应改变退出码
         logger.error(f"{LogEmoji.ERROR} 推送阶段发生异常: {e}")
 
