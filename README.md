@@ -76,13 +76,13 @@
 - 字段名固定，出现其他字段直接报错。
 - 重复 Cookie 自动去重，不会重复签到。
 - 旧 `&` 分隔仍兼容但会提示迁移；换行分隔、字符串数组、单个对象已不支持。
-- **填了 `origin` 就完全跳过域名探测**，直接对这一个域名发请求，最省时间也最不容易被限流。
+- **填了 `origin` 不会跳过探测**，只是把它排在第一位优先尝试；命中即停，若该域名不可用仍会自动回退并发探测其余候选域名。这样即使填写的域名在当前网络下不通（例如境内可达、GitHub Actions 境外出口不可达），签到也不会失败。
 
 **如何获取**
 
 签到页按 `F12` → `Network` → 刷新 → 选中任一请求 → `Request Headers`，复制 `Cookie` 与 `User-Agent` 的完整值。
 
-**探测顺序**（不填 `origin` 时按此顺序，命中即停）
+**探测顺序**（填了 `origin` 时它排第一，其余按此顺序补齐；并发发起，命中即停）
 
 `glados.cloud` → `railgun.info` → `glados.network` → `glados.rocks` → `glados.one` → `glados.space` → `glados.vip` → `glados-facility.com`
 
@@ -200,7 +200,7 @@ schedule:
 <details>
 <summary><strong>Q：需要标注每条 Cookie 属于哪个域名吗？</strong></summary>
 
-不需要，脚本会自动探测。填 `origin` 的好处是少发几个探测请求、日志更清楚。注意**各站 Cookie 通常不互通**，每条 Cookie 必须来自它真正登录的站点。
+不需要，脚本会自动探测。填 `origin` 的好处是让常用域名优先命中、日志更清楚，并不会减少探测请求数。注意**不同服务的 Cookie 通常不互通**，每条 Cookie 必须来自它真正登录的站点；同一服务的多个镜像域名可能共享会话，脚本会自动选用当前网络下可用的那个。
 
 </details>
 
